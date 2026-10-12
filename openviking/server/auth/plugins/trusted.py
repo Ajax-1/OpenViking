@@ -16,6 +16,7 @@ from openviking.core.identifiers import validate_account_id, validate_user_id
 from openviking.server.api_keys import APIKeyManager
 from openviking.server.auth.plugin import AuthPlugin
 from openviking.server.identity import ResolvedIdentity, Role
+from openviking.server.store_assembly import build_api_key_manager
 from openviking_cli.exceptions import InvalidArgumentError, UnauthenticatedError
 from openviking_cli.utils import get_logger
 
@@ -64,11 +65,16 @@ def _is_trusted_admin_path(path: str) -> bool:
     return path == "/api/v1/admin" or path.startswith("/api/v1/admin/")
 
 
-def _asserted_role_from_header(request: Request) -> Optional[Role]:
+def _asserted_role_from_header(request: Request, *, allow_assertion: bool) -> Optional[Role]:
     raw_role = request.headers.get(_TRUSTED_ROLE_HEADER)
     normalized_role = _normalize_request_value(raw_role)
     if normalized_role is None:
         return None
+    if not allow_assertion:
+        raise InvalidArgumentError(
+            f"{_TRUSTED_ROLE_HEADER} requires trusted mode with Root API Key enabled."
+        )
+
     role = normalized_role.lower()
     if role not in _TRUSTED_ASSERTABLE_ROLES:
         raise InvalidArgumentError(f"{_TRUSTED_ROLE_HEADER} must be one of: user, admin.")
@@ -79,7 +85,7 @@ class TrustedAuthPlugin(AuthPlugin):
     """Trusted mode: trust X-OpenViking-Account/User headers.
 
     Requires a matching root_api_key on every authenticated request. Role is looked up from
-    APIKeyManager if the user exists, otherwise defaults to USER.
+    AccountStore if the user exists, otherwise defaults to USER.
     """
 
     auth_mode = "trusted"
@@ -93,6 +99,7 @@ class TrustedAuthPlugin(AuthPlugin):
         self._pending_count = 0
         self._in_flight_count = 0
         self._flush_task: Optional[asyncio.Task] = None
+        self._flush_lock = asyncio.Lock()
 
     async def resolve_identity(
         self,
@@ -102,19 +109,20 @@ class TrustedAuthPlugin(AuthPlugin):
         x_openviking_account: Optional[str] = None,
         x_openviking_user: Optional[str] = None,
     ) -> ResolvedIdentity:
+        if api_key is None:
+            api_key = request.headers.get("X-API-Key")
         configured_root_api_key = request.app.state.config.root_api_key
         if not api_key:
             raise UnauthenticatedError(
                 "Missing API Key in trusted mode. Send X-API-Key with the value of "
-                "server.root_api_key from the server's ov.conf. In Web Studio, enter "
-                "this value in Connection settings > Root or Admin API Key."
+                "server.root_api_key from the server's ov.conf."
             )
         if not configured_root_api_key or not hmac.compare_digest(api_key, configured_root_api_key):
             raise UnauthenticatedError(
                 "Invalid API Key in trusted mode. The supplied key must match "
                 "server.root_api_key in the server's ov.conf."
             )
-        asserted_role = _asserted_role_from_header(request)
+        asserted_role = _asserted_role_from_header(request, allow_assertion=True)
 
         explicit_account_id, explicit_user_id = _explicit_identity_from_request(request)
         if (
@@ -153,24 +161,31 @@ class TrustedAuthPlugin(AuthPlugin):
             raise InvalidArgumentError(
                 "Trusted mode requests must include " + " and ".join(missing_fields) + "."
             )
+
         _validate_trusted_identity(effective_account_id, effective_user_id)
 
-        api_key_manager = self._api_key_manager
-        trusted_role = Role.USER
+        local_role = None
         if asserted_role is not None:
             trusted_role = asserted_role
-        elif api_key_manager:
-            looked_up_role = api_key_manager.get_user_role(effective_account_id, effective_user_id)
-            if looked_up_role is not None:
-                trusted_role = looked_up_role
+        else:
+            if self._api_key_manager and effective_account_id and effective_user_id:
+                local_role = await self._api_key_manager.get_registered_user_role(
+                    effective_account_id, effective_user_id
+                )
+            trusted_role = local_role or Role.USER
 
         identity = ResolvedIdentity(
             role=trusted_role,
             account_id=effective_account_id,
             user_id=effective_user_id,
         )
-        if self.should_auto_register_trusted_identity(request):
-            self._queue_trusted_identity(effective_account_id, effective_user_id)
+        if (
+            self.should_auto_register_trusted_identity(request)
+            and not is_admin_path
+            and effective_account_id
+            and effective_user_id
+        ):
+            await self._queue_trusted_identity(effective_account_id, effective_user_id)
         return identity
 
     def validate_config(self, config) -> None:
@@ -184,15 +199,19 @@ class TrustedAuthPlugin(AuthPlugin):
         sys.exit(1)
 
     async def initialize(self, app, service, config) -> None:
-        api_key_manager = APIKeyManager(
+        manager = build_api_key_manager(
             root_key=config.root_api_key,
             viking_fs=service.viking_fs,
             api_key_hashing_enabled=config.api_key_hashing_enabled,
+            account_store_provider=config.account_store.provider,
+            account_store_params=config.account_store.params,
+            account_store_watch_enabled=config.api_key_watch_enabled,
+            account_store_watch_interval_seconds=config.api_key_watch_interval_seconds,
             issue_user_keys=False,
         )
-        await api_key_manager.load()
-        self._api_key_manager = api_key_manager
-        app.state.api_key_manager = api_key_manager
+        await manager.load()
+        self._api_key_manager = manager
+        app.state.api_key_manager = manager
         self._flush_interval_seconds = config.trusted_identity_flush_interval_seconds
         self._pending_max_size = config.trusted_identity_pending_max_size
         if self._flush_interval_seconds > 0:
@@ -205,12 +224,13 @@ class TrustedAuthPlugin(AuthPlugin):
         """Return whether this trusted request's identity should be batch registered."""
         return self._flush_interval_seconds > 0
 
-    def _queue_trusted_identity(self, account_id: str, user_id: str) -> None:
-        if self._api_key_manager and (
-            self._api_key_manager.is_deleting(account_id, user_id)
-            or self._api_key_manager.has_user(account_id, user_id)
-        ):
-            return
+    async def _queue_trusted_identity(self, account_id: str, user_id: str) -> None:
+        manager = self._api_key_manager
+        if manager is not None:
+            if await manager.get_deletion(account_id, user_id) is not None:
+                return
+            if await manager.get_user(account_id, user_id) is not None:
+                return
         if user_id in self._in_flight.get(account_id, set()):
             return
         if user_id in self._pending.get(account_id, set()):
@@ -226,6 +246,10 @@ class TrustedAuthPlugin(AuthPlugin):
         self._pending_count += 1
 
     async def flush_trusted_identities(self) -> None:
+        async with self._flush_lock:
+            await self._flush_batch()
+
+    async def _flush_batch(self) -> None:
         if self._api_key_manager is None or not self._pending:
             return
         batch = self._pending
@@ -235,14 +259,14 @@ class TrustedAuthPlugin(AuthPlugin):
         self._in_flight = batch
         try:
             await self._api_key_manager.ensure_trusted_identities(batch)
-        except Exception:
+        except BaseException as exc:
             pending_after_failure = self._pending
             for account_id, user_ids in batch.items():
                 pending_after_failure.setdefault(account_id, set()).update(user_ids)
             self._pending = pending_after_failure
             self._pending_count += self._in_flight_count
-            self._in_flight = {}
-            self._in_flight_count = 0
+            if not isinstance(exc, Exception):
+                raise
             logger.warning("Trusted identity batch registration failed; will retry", exc_info=True)
         finally:
             self._in_flight = {}
@@ -268,7 +292,18 @@ class TrustedAuthPlugin(AuthPlugin):
                 pass
             finally:
                 self._flush_task = None
-        await self.flush_trusted_identities()
+        try:
+            await self.flush_trusted_identities()
+        finally:
+            manager = self._api_key_manager
+            try:
+                if manager is not None:
+                    await manager.close()
+            finally:
+                self._api_key_manager = None
+
+    def can_skip_api_key_for_bot_proxy(self) -> bool:
+        return True
 
     def get_request_context_checks(
         self,
