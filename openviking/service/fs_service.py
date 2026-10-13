@@ -1225,7 +1225,7 @@ class FSService:
         tag_mode: str = "replace",
         acl: AclSpec | Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
-        """Write to an existing file and refresh semantics/vectors."""
+        """Create or update a file and refresh semantics/vectors."""
         viking_fs = self._ensure_initialized()
         coordinator = ContentWriteCoordinator(viking_fs=viking_fs, vikingdb=self._vikingdb)
         return await coordinator.write(
@@ -1250,6 +1250,7 @@ class FSService:
         wait: bool = True,
         timeout: Optional[float] = None,
         skip_conflicts: bool = False,
+        processing_mode: str = "semantic_and_vectors",
     ) -> Dict[str, Any]:
         """Apply multiple file writes and aggregate downstream refresh."""
         viking_fs = self._ensure_initialized()
@@ -1261,6 +1262,7 @@ class FSService:
             wait=wait,
             timeout=timeout,
             skip_conflicts=skip_conflicts,
+            processing_mode=processing_mode,
         )
 
     async def set_tags(
