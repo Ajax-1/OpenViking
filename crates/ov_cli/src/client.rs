@@ -765,6 +765,7 @@ impl HttpClient {
         uri: String,
         image: Option<String>,
         search_type: String,
+        mode: String,
         session_id: Option<String>,
         node_limit: i32,
         threshold: Option<f64>,
@@ -782,6 +783,8 @@ impl HttpClient {
             "query": query,
             "image_url": image_url,
             "search_type": search_type,
+            // Preserve the legacy request shape for servers without context mode.
+            "mode": (mode != "list").then_some(mode),
             "target_uri": uri,
             "session_id": session_id,
             "limit": node_limit,
@@ -2127,18 +2130,84 @@ mod tests {
         assert_eq!(body["processing_mode"], "vectors_only");
     }
 
-    #[test]
-    fn compact_request_body_drops_default_search_type_for_legacy_servers() {
-        let mut body = json!({"query": "OAuth token", "search_type": "semantic"});
-        super::compact_request_body(&mut body);
-        assert!(!body.as_object().unwrap().contains_key("search_type"));
+    #[tokio::test]
+    async fn search_list_request_preserves_legacy_server_compatibility() {
+        let (base_url, request_rx) = spawn_request_capture_server().await;
+        let client = HttpClient::new(base_url, None, None, None, None, 5.0, false, None);
+        client
+            .search(
+                "OAuth token".to_string(),
+                String::new(),
+                None,
+                "semantic".to_string(),
+                "list".to_string(),
+                None,
+                10,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+            )
+            .await
+            .expect("list search should succeed");
+
+        let request = request_rx.await.expect("request should be captured");
+        assert!(request.starts_with("POST /api/v1/search/search "));
+        let (_, body) = request.split_once("\r\n\r\n").expect("request body");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(body).unwrap(),
+            json!({"query": "OAuth token", "target_uri": "", "limit": 10})
+        );
     }
 
-    #[test]
-    fn compact_request_body_keeps_keywords_search_type() {
-        let mut body = json!({"query": "OAuth token", "search_type": "keywords"});
-        super::compact_request_body(&mut body);
-        assert_eq!(body["search_type"], "keywords");
+    #[tokio::test]
+    async fn search_context_request_preserves_keywords_and_session_options() {
+        let (base_url, request_rx) = spawn_request_capture_server().await;
+        let client = HttpClient::new(base_url, None, None, None, None, 5.0, false, None);
+        client
+            .search(
+                "OAuth token".to_string(),
+                String::new(),
+                None,
+                "keywords".to_string(),
+                "context".to_string(),
+                Some("session-1".to_string()),
+                3,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(vec!["memory".to_string()]),
+                Some(vec!["project=openviking".to_string()]),
+                false,
+                Some("7d".to_string()),
+            )
+            .await
+            .expect("context search should succeed");
+
+        let request = request_rx.await.expect("request should be captured");
+        assert!(request.starts_with("POST /api/v1/search/search "));
+        let (_, body) = request.split_once("\r\n\r\n").expect("request body");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(body).unwrap(),
+            json!({
+                "query": "OAuth token",
+                "target_uri": "",
+                "search_type": "keywords",
+                "mode": "context",
+                "session_id": "session-1",
+                "limit": 3,
+                "context_type": ["memory"],
+                "tags": ["project=openviking"],
+                "events_time_decay_protection": "7d"
+            })
+        );
     }
 
     #[test]
