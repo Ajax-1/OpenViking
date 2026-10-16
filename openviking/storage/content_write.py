@@ -171,6 +171,13 @@ def _queue_has_errors(queue_status: Optional[Dict[str, Any]], name: str) -> bool
         return bool(status.get("errors"))
 
 
+def _result_has_queue_errors(result: Any) -> bool:
+    if not isinstance(result, dict):
+        return False
+    queue_status = result.get("queue_status")
+    return any(_queue_has_errors(queue_status, name) for name in ("Semantic", "Embedding"))
+
+
 @dataclass(frozen=True)
 class _BatchRefreshOutcome:
     queue_status: Optional[Dict[str, Any]]
@@ -257,7 +264,13 @@ class ContentWriteCoordinator:
         tag_mode: str = "replace",
         acl: AclSpec | Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
+        return_terminal_result = wait and get_task_context() is None
+
         async def execute() -> Dict[str, Any]:
+            context = get_task_context()
+            wait_for_queues = not (
+                return_terminal_result and context is not None and context.work_id is not None
+            )
             return await self._write(
                 uri=uri,
                 content=content,
@@ -268,6 +281,7 @@ class ContentWriteCoordinator:
                 tags=tags,
                 tag_mode=tag_mode,
                 acl=acl,
+                wait_for_queues=wait_for_queues,
             )
 
         result, _task_id = await run_tracked_operation(
@@ -277,6 +291,7 @@ class ContentWriteCoordinator:
             operation=execute,
             wait=wait,
             resource_id=uri,
+            return_terminal_result=return_terminal_result,
         )
         return result
 
@@ -292,6 +307,7 @@ class ContentWriteCoordinator:
         tags: list[str] | None = None,
         tag_mode: str = "replace",
         acl: AclSpec | Dict[str, Any] | None = None,
+        wait_for_queues: bool = True,
     ) -> Dict[str, Any]:
         self._validate_mode(mode)
         processing_mode = normalize_processing_mode(processing_mode)
@@ -337,6 +353,7 @@ class ContentWriteCoordinator:
                 ctx=ctx,
                 telemetry_id=telemetry_id,
                 ingest_options=ingest_options,
+                wait_for_queues=wait_for_queues,
             )
 
         return await self._write_direct_with_refresh(
@@ -351,6 +368,7 @@ class ContentWriteCoordinator:
             telemetry_id=telemetry_id,
             processing_mode=processing_mode,
             ingest_options=ingest_options,
+            wait_for_queues=wait_for_queues,
         )
 
     async def batch_write(
@@ -363,7 +381,13 @@ class ContentWriteCoordinator:
         skip_conflicts: bool = False,
         processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
     ) -> Dict[str, Any]:
+        return_terminal_result = wait and get_task_context() is None
+
         async def execute() -> Dict[str, Any]:
+            context = get_task_context()
+            wait_for_queues = not (
+                return_terminal_result and context is not None and context.work_id is not None
+            )
             return await self._batch_write(
                 root_uri=root_uri,
                 operations=operations,
@@ -371,6 +395,7 @@ class ContentWriteCoordinator:
                 wait=wait,
                 skip_conflicts=skip_conflicts,
                 processing_mode=processing_mode,
+                wait_for_queues=wait_for_queues,
             )
 
         result, _task_id = await run_tracked_operation(
@@ -380,7 +405,11 @@ class ContentWriteCoordinator:
             operation=execute,
             wait=wait,
             resource_id=root_uri,
+            accept_failed_result=_result_has_queue_errors if return_terminal_result else None,
+            return_terminal_result=return_terminal_result,
         )
+        if return_terminal_result:
+            self._raise_refresh_errors(result.get("queue_status", {}))
         return result
 
     async def _batch_write(
@@ -392,6 +421,7 @@ class ContentWriteCoordinator:
         wait: bool = True,
         skip_conflicts: bool = False,
         processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
+        wait_for_queues: bool = True,
     ) -> Dict[str, Any]:
         """Write a bundle under one directory, then refresh it as a batch.
 
@@ -697,12 +727,12 @@ class ContentWriteCoordinator:
                 lock_settled = True
                 queue_status = (
                     await self._wait_for_request(telemetry_id=telemetry_id)
-                    if wait
+                    if wait and wait_for_queues
                     else refresh_outcome.queue_status
                     if refresh_outcome is not None
                     else None
                 )
-                if wait and queue_status is not None and write_error is None:
+                if wait and wait_for_queues and queue_status is not None and write_error is None:
                     self._raise_refresh_errors(queue_status)
                 if refresh_outcome is not None and queue_status is not None:
                     refresh_outcome = replace(refresh_outcome, queue_status=queue_status)
@@ -734,7 +764,7 @@ class ContentWriteCoordinator:
         if skip_conflicts:
             result["conflicts"] = conflicts
         if refresh_outcome is not None:
-            semantic_status, vector_status = refresh_outcome.statuses(wait=wait)
+            semantic_status, vector_status = refresh_outcome.statuses(wait=wait and wait_for_queues)
             result["semantic_status"] = semantic_status
             result["vector_status"] = vector_status
         return result
@@ -1560,6 +1590,7 @@ class ContentWriteCoordinator:
         telemetry_id: str,
         processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
         ingest_options: IngestOptions | None = None,
+        wait_for_queues: bool = True,
     ) -> Dict[str, Any]:
         # ``.abstract.md`` / ``.overview.md`` are generated sidecars whose body is
         # re-embedded in place (no LLM regeneration and no RNFV plan). Keep that
@@ -1576,6 +1607,7 @@ class ContentWriteCoordinator:
                 ctx=ctx,
                 telemetry_id=telemetry_id,
                 ingest_options=ingest_options,
+                wait_for_queues=wait_for_queues,
             )
 
         lock_path = self._viking_fs._uri_to_path(uri, ctx=ctx)
@@ -1672,10 +1704,14 @@ class ContentWriteCoordinator:
                 await self._viking_fs._async_agfs.pathlock_release(lease)
             lock_settled = True
 
-            queue_status = await self._wait_for_request(telemetry_id=telemetry_id) if wait else None
+            queue_status = (
+                await self._wait_for_request(telemetry_id=telemetry_id)
+                if wait and wait_for_queues
+                else None
+            )
             written_bytes = len(final_bytes)
             semantic_status, vector_status = self._plan_statuses(
-                work, wait=wait, queue_status=queue_status
+                work, wait=wait and wait_for_queues, queue_status=queue_status
             )
             return self._build_write_result(
                 uri=uri,
@@ -1780,6 +1816,7 @@ class ContentWriteCoordinator:
         ctx: RequestContext,
         telemetry_id: str,
         ingest_options: IngestOptions | None = None,
+        wait_for_queues: bool = True,
     ) -> Dict[str, Any]:
         """Re-embed a manually edited L0/L1 sidecar body without LLM regeneration."""
         lock_path = self._viking_fs._uri_to_path(uri, ctx=ctx)
@@ -1805,10 +1842,14 @@ class ContentWriteCoordinator:
             )
             await self._viking_fs._async_agfs.pathlock_release(lease)
             lock_released = True
-            queue_status = await self._wait_for_request(telemetry_id=telemetry_id) if wait else None
+            queue_status = (
+                await self._wait_for_request(telemetry_id=telemetry_id)
+                if wait and wait_for_queues
+                else None
+            )
             vector_status = self._queue_work_status(
                 requested=vector_enqueued,
-                wait=wait,
+                wait=wait and wait_for_queues,
                 queue_status=queue_status,
                 queue_name="Embedding",
             )
@@ -2121,7 +2162,7 @@ class ContentWriteCoordinator:
                 await tracker.wait_for_work(context.task_id, work_ids, timeout=None)
         except (TimeoutError, asyncio.TimeoutError) as exc:
             raise DeadlineExceededError("queue processing", None) from exc
-        return tracker.build_queue_status(
+        return await tracker.build_queue_status(
             context.task_id, work_ids if context.work_id is not None else None
         )
 
@@ -2137,6 +2178,7 @@ class ContentWriteCoordinator:
         ctx: RequestContext,
         telemetry_id: str,
         ingest_options: IngestOptions | None = None,
+        wait_for_queues: bool = True,
     ) -> Dict[str, Any]:
         lock_path = self._viking_fs._uri_to_path(uri, ctx=ctx)
         try:
@@ -2181,13 +2223,13 @@ class ContentWriteCoordinator:
                 ingest_options=ingest_options,
             )
             queue_status = None
-            if embedding_requested and wait:
+            if embedding_requested and wait and wait_for_queues:
                 queue_status = await self._wait_for_request(
                     telemetry_id=telemetry_id,
                 )
             vector_status = self._queue_work_status(
                 requested=embedding_requested,
-                wait=wait,
+                wait=wait and wait_for_queues,
                 queue_status=queue_status,
                 queue_name="Embedding",
             )
