@@ -42,6 +42,16 @@ description: 用 Docker Compose、Helm 或独立进程部署 OpenViking 网关�
 
 管理密钥不提供命令行参数，因为命令行参数会出现在进程列表和 shell 历史里。设置、更换或去掉管理密钥后需要重启，这不会吊销已签发的网关密钥，也不会改动已有的上游和上下文配置。
 
+#### 忘记网关管理密钥
+
+到网关读取它的位置查找：
+
+- 环境变量 `OPENVIKING_GATEWAY_MANAGEMENT_KEY` 优先于配置文件。Compose 部署一般写在 `docker-compose.yml` 旁边的 `.env` 里；Helm 从 `gateway.existingSecret` 指定的 Secret 中读取 `management-key` 字段。
+- 没有设置环境变量时，看 `ov.conf` 的 `gateway.management_key`（嵌入）或 `gateway.conf` 的 `management_key`（独立）。值写成 `$VAR` 时，密钥在对应的环境变量里。
+- 嵌入部署的 root 还可以在 Studio 的**设置** → **服务端配置** → **文件编辑**中查看 `ov.conf`。`openviking-server init` 和 Studio **开启网关**生成的密钥都以明文保存在这里。
+
+实在找不回来，就在原来的位置换一个至少 32 个字符的新值（可以用 `openssl rand -base64 32` 生成），然后重启。已签发的网关密钥、上游和上下文配置都不受影响。把环境变量设为空字符串不会清除文件里的值，需要删掉这个变量。
+
 ### 加密
 
 网关用 OpenViking 自己的加密功能保护已存的凭证和对话状态（见[加密指南](08-encryption.md)）：
@@ -368,7 +378,7 @@ ov.example.com {
 
 **概览**标签页汇总日志保留期（默认 30 天）内最新的 10,000 条请求：
 
-- 第一个请求到达之前，显示**快速开始**清单，顺序是“上游 → 上下文配置 → 签发密钥 → 接入”。
+- 第一个请求到达之前，显示**快速开始**清单，顺序是“上游 → 上下文配置 → 签发密钥 → 接入”。还没有密钥时，清单里的**快速模式**卡片一键完成前三步：没有可用上游时导入 OpenViking 的 VLM 配置，没有上下文配置时用推荐设置新建一份，再为当前用户签发密钥。本地 dev 模式以外，root 改为在签发对话框里选择密钥归属的用户。
 - **请求数**：模型请求的数量、最近一次请求的时间，以及这些请求的输出 token。
 - **首次调用缓存命中率**：每条新用户消息的第一次模型调用中，命中服务商提示缓存的输入 token 所占比例。这是判断网关是否健康最重要的指标，应该接近不经过网关时服务商能达到的水平；明显下降通常说明网关发送的历史和上一次对不上了，见[首次调用缓存命中率下降](#首次调用缓存命中率下降)。
 - **轮内缓存命中率**：同一轮里后续调用的命中率，例如工具步骤和 OpenViking 工具的往返，通常很高。
@@ -790,7 +800,7 @@ URL 必须是 HTTP(S)，不能含凭证、查询参数或 fragment。未知字�
 | 网关不支持 Trusted 模式（`trusted_mode_unsupported`） | 把 Server 改为 `api_key` 认证。 |
 | 网关连不上 OpenViking（`openviking_unreachable`） | 只出现在独立网关：检查 `openviking_url`（`gateway.conf` 或 `OPENVIKING_GATEWAY_OPENVIKING_URL`）和网络。 |
 
-“上游”和“上下文配置”标签页只读，是因为部署者设置了网关管理密钥：点**输入网关管理密钥**解锁。OpenViking 的 root 或 admin API 密钥不能解锁编辑；管理密钥被更换后（`management_key_invalid`），Studio 会重新锁定。
+“上游”和“上下文配置”标签页只读，是因为部署者设置了网关管理密钥：点**输入网关管理密钥**解锁。OpenViking 的 root 或 admin API 密钥不能解锁编辑；管理密钥被更换后（`management_key_invalid`），Studio 会重新锁定。没人记得密钥时，见[忘记网关管理密钥](#忘记网关管理密钥)。
 
 ### 签发密钥失败
 
