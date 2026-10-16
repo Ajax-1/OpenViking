@@ -482,10 +482,9 @@ class ProxyRequest:
                     async for chunk in response.content.iter_any():
                         if observe:
                             try:
-                                for frame in decoder.feed(chunk):
-                                    data = decoder.data(frame)
-                                    if data:
-                                        capture.event(data)
+                                # A chunk inside one event completes none: no reply to reread.
+                                if frames := decoder.feed(chunk):
+                                    capture.events(d for d in map(decoder.data, frames) if d)
                             except Exception:
                                 observe = False
                                 capture.complete = False
