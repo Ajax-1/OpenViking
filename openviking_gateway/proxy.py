@@ -403,6 +403,7 @@ class ProxyRequest:
             self.credential,
             self.config.public_url,
             self.config.max_body_bytes,
+            self.config.mcp_file_links,
         )
         loop = HiddenToolLoop(prepared, executor, self.store, capture)
         headers = {
