@@ -30,6 +30,7 @@ import {
 } from '../-lib/use-gateway'
 import { ErrorState, LoadingState } from './empty-state'
 import { MetricCard } from './metric-card'
+import { CacheNotices } from './overview-cache'
 import { RecentRequests } from './overview-recent'
 import { OverviewSetup } from './overview-setup'
 import { DegradedRequestsCard, OpenVikingCard } from './overview-status'
@@ -175,6 +176,9 @@ export function OverviewPage() {
         <>
           {data.last_request_at == null ? <OverviewSetup /> : null}
           <MetricRow data={data} />
+          {data.cache_alerts ? (
+            <CacheNotices alerts={data.cache_alerts} />
+          ) : null}
           <div className="grid gap-3 lg:grid-cols-2">
             <OpenVikingCard
               health={data.openviking}
