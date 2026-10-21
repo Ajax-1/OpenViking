@@ -344,6 +344,8 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
             "use text from the conversation or the new facts you intend to add as a search anchor. "
             "If you copy from numbered read output, exclude the `line_number<TAB>` prefix. If the "
             "change is too broad for a clean snippet, use obj.field.update(complete_new_value) instead. "
+            "For fields marked [replace], use obj.field.update(complete_new_value), including "
+            "all unchanged text. "
             "Regenerate the complete restricted Python SDK program, including previous successful "
             "operations and fixed failed operations. Output only Python code."
             "\n\nFailed edits:\n" + details
@@ -1108,10 +1110,9 @@ class _PythonProgramCompiler:
             # Preserve established values, but allow filling a blank template field.
             return
         if handle.full_value is not _UNSET:
-            owner.fields[name] = handle.full_value
-            owner.changed_fields[name] = handle.full_value
+            self._set_changed_field(owner, name, handle.full_value, node)
             return
-        # Local edit chain: only valid for existing PATCH string fields.
+        # Replace strings still advertise update(), but accept an explicit edit at runtime.
         if not owner.existing:
             self._error(
                 node,
@@ -1119,18 +1120,14 @@ class _PythonProgramCompiler:
                 "this program has no prior content — pass the complete value to field.update()",
             )
         if field_schema is None or not (
-            field_schema.merge_op == MergeOp.PATCH and field_schema.field_type == FieldType.STRING
+            field_schema.merge_op in {MergeOp.PATCH, MergeOp.REPLACE}
+            and field_schema.field_type == FieldType.STRING
         ):
-            guidance = "edit()/drop() require an editable string (merge_op=patch)"
-            if field_schema is not None and (
-                field_schema.merge_op == MergeOp.REPLACE
-                and field_schema.field_type == FieldType.STRING
-            ):
-                guidance = (
-                    "merge_op=replace requires the complete new value, including unchanged text; "
-                    f'use `{owner.name}.{_identifier_alias(name)}.update("""complete new value""")`'
-                )
-            self._error(node, f"field {name!r} does not support edit()/drop(): {guidance}")
+            self._error(
+                node,
+                f"field {name!r} does not support edit()/drop(): "
+                "edit()/drop() require a string with merge_op=patch or replace",
+            )
         # Do NOT apply here. Store the edits as a StrPatch so python mode flows through
         # the same resolve_operations -> _validate_patch_operations -> patch-repair path
         # as json mode: a failed snippet is isolated to its own operation and gets the
@@ -1139,8 +1136,34 @@ class _PythonProgramCompiler:
         existing = owner.changed_fields.get(name)
         prior_blocks = existing.blocks if isinstance(existing, StrPatch) else []
         patch = StrPatch(blocks=[*prior_blocks, *handle.blocks])
-        owner.fields[name] = patch
-        owner.changed_fields[name] = patch
+        self._set_changed_field(owner, name, patch, node)
+
+    def _set_changed_field(
+        self, owner: _MemoryObject, name: str, value: Any, node: ast.AST
+    ) -> None:
+        field_schema = next(
+            (item for item in self.schemas[owner.memory_type].fields if item.name == name), None
+        )
+        previous = owner.changed_fields.get(name)
+        if (
+            owner.existing
+            and field_schema is not None
+            and field_schema.merge_op == MergeOp.REPLACE
+            and field_schema.field_type == FieldType.STRING
+            and (
+                isinstance(previous, str)
+                and isinstance(value, (StrPatch, dict))
+                or isinstance(previous, (StrPatch, dict))
+                and isinstance(value, str)
+            )
+        ):
+            self._error(
+                node,
+                f"replace field {name!r} cannot mix complete values and patches in one program; "
+                "use complete update() values or only edit()/drop() patches",
+            )
+        owner.fields[name] = value
+        owner.changed_fields[name] = value
 
     def _eval_keywords(
         self,
@@ -1194,8 +1217,7 @@ class _PythonProgramCompiler:
                 owner.changed_fields[name] = previous_delta + changes[name]
                 owner.fields[name] = value
                 continue
-            owner.fields[name] = value
-            owner.changed_fields[name] = value
+            self._set_changed_field(owner, name, value, node)
 
     def _build_operations(self) -> Any:
         payload: dict[str, Any] = {name: [] for name in self.context.operations_model.model_fields}
