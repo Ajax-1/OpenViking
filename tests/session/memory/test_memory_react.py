@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 from openviking.session.memory.dataclass import (
     MemoryField,
     MemoryFile,
+    MemoryOperationSkipCode,
     MemoryTypeSchema,
     ResolvedOperation,
     ResolvedOperations,
@@ -224,6 +225,79 @@ class TestExtractLoopFinalJsonRetry:
             "memory_type": "preferences",
             "user_id": "user_a",
         }
+
+    @pytest.mark.asyncio
+    async def test_unrenderable_uri_skips_only_that_item(self):
+        class TopicItem(BaseModel):
+            topic_name: str | None = None
+            content: str
+
+        class Operations(BaseModel):
+            topics: list[TopicItem]
+            delete_ids: list = Field(default_factory=list)
+
+        schema = MemoryTypeSchema(
+            memory_type="topics",
+            directory="viking://user/{{ user_space }}/memories/topics",
+            filename_template="{{ topic_name }}.md",
+            fields=[],
+        )
+        extract_loop = self._invalid_peer_resolution_loop()
+        extract_loop.context_provider.get_memory_schemas.return_value = [schema]
+
+        resolved, _ = await extract_loop.resolve_operations(
+            Operations(
+                topics=[
+                    TopicItem(topic_name=None, content="model omitted the name"),
+                    TopicItem(topic_name="kickoff", content="valid item"),
+                ]
+            )
+        )
+
+        broken, valid = resolved.upsert_operations
+        assert broken.uris == []
+        assert (
+            broken.resolution_skip.reason_code == MemoryOperationSkipCode.INVALID_URI_TEMPLATE_VARS
+        )
+        assert "topic_name" in broken.resolution_skip.reason
+        assert valid.uris == ["viking://user/user_a/memories/topics/kickoff.md"]
+        assert valid.resolution_skip is None
+
+    @pytest.mark.asyncio
+    async def test_event_without_event_name_does_not_abort_batch(self):
+        class EventItem(BaseModel):
+            event_name: str | None = None
+            summary: str
+
+        class Operations(BaseModel):
+            events: list[EventItem]
+            delete_ids: list = Field(default_factory=list)
+
+        schema = MemoryTypeSchema(
+            memory_type="events",
+            directory="viking://user/{{ user_space }}/memories/events",
+            filename_template="{{ event_name }}.md",
+            operation_mode="add_only",
+            fields=[],
+        )
+        extract_loop = self._invalid_peer_resolution_loop()
+        extract_loop.context_provider.get_memory_schemas.return_value = [schema]
+
+        resolved, _ = await extract_loop.resolve_operations(
+            Operations(
+                events=[
+                    EventItem(event_name=None, summary="model omitted the name"),
+                    EventItem(event_name="kickoff", summary="valid event"),
+                ]
+            )
+        )
+
+        broken, valid = resolved.upsert_operations
+        assert broken.uris == []
+        assert (
+            broken.resolution_skip.reason_code == MemoryOperationSkipCode.INVALID_URI_TEMPLATE_VARS
+        )
+        assert valid.uris == ["viking://user/user_a/memories/events/kickoff.md"]
 
     @pytest.mark.asyncio
     async def test_existing_page_id_recomputes_uri_for_mutable_identity_fields(self):

@@ -883,11 +883,7 @@ class ExtractLoop:
                 if is_event:
                     # Event page_ids are temporary link anchors. They must never select an
                     # existing memory file; URI collision handling remains unchanged downstream.
-                    resolved_op.uris = self._isolation_handler.calculate_memory_uris(
-                        memory_type_schema=schema,
-                        operation=resolved_op,
-                        extract_context=self._extract_context,
-                    )
+                    resolved_op.uris = self._calculate_memory_uris_or_skip(schema, resolved_op)
                 elif requested_page_id is not None and page_id_map is not None:
                     resolved_uri = page_id_map.resolve(requested_page_id)
                     if resolved_uri:
@@ -935,17 +931,9 @@ class ExtractLoop:
                             if target_uri != resolved_uri:
                                 resolved_op.uris = [target_uri]
                     else:
-                        resolved_op.uris = self._isolation_handler.calculate_memory_uris(
-                            memory_type_schema=schema,
-                            operation=resolved_op,
-                            extract_context=self._extract_context,
-                        )
+                        resolved_op.uris = self._calculate_memory_uris_or_skip(schema, resolved_op)
                 else:
-                    resolved_op.uris = self._isolation_handler.calculate_memory_uris(
-                        memory_type_schema=schema,
-                        operation=resolved_op,
-                        extract_context=self._extract_context,
-                    )
+                    resolved_op.uris = self._calculate_memory_uris_or_skip(schema, resolved_op)
 
                 upsert_operations.append(resolved_op)
 
@@ -1028,6 +1016,31 @@ class ExtractLoop:
                     break
 
         return resolved, raw_links
+
+    def _calculate_memory_uris_or_skip(
+        self,
+        schema: Any,
+        operation: ResolvedOperation,
+    ) -> List[str]:
+        """Compute one operation's URIs; a path that cannot be rendered skips only that item."""
+        try:
+            return self._isolation_handler.calculate_memory_uris(
+                memory_type_schema=schema,
+                operation=operation,
+                extract_context=self._extract_context,
+            )
+        except ValueError as exc:
+            # e.g. an Event emitted without event_name: drop this item, keep the rest of the batch
+            logger.warning(
+                "Skipping %s memory operation with unrenderable URI: %s",
+                operation.memory_type,
+                exc,
+            )
+            operation.resolution_skip = MemoryOperationSkip(
+                reason_code=MemoryOperationSkipCode.INVALID_URI_TEMPLATE_VARS,
+                reason=str(exc),
+            )
+            return []
 
     async def _updated_uri_for_existing_operation(
         self,
